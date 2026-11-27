@@ -6,18 +6,30 @@ Usage:
 import argparse
 import re
 import sys
-
+import socket
 from core.app import App
 
 NAME_PATTERN = re.compile(r"^[^\s|]{1,20}$")
 MIN_PYTHON = (3, 14)
 
 
+
+
+def detect_broadcast():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # không gửi dữ liệu, chỉ để Windows chọn card đi ra
+        ip = s.getsockname()[0]
+    finally:
+        s.close()
+    parts = ip.split(".")
+    return ".".join(parts[:3] + ["255"])
+    
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="LAN chat and file sharing")
     parser.add_argument("--name", required=True, help="your display name")
     parser.add_argument("--port", type=int, default=5000, help="TCP port for chat and files")
-    parser.add_argument("--broadcast", default="255.255.255.255",
+    parser.add_argument("--broadcast", default=detect_broadcast(),
                         help="broadcast address (use 127.255.255.255 for same-PC testing)")
     return parser.parse_args(argv)
 
