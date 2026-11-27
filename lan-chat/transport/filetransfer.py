@@ -1,118 +1,148 @@
-"""TCP file transfer: dedicated socket per file with progress and temp cleanup."""
+"""File transfer over TCP.
+
+Each file uses its own TCP connection: ``FILE|<filename>|<size>\\n``
+followed by exactly ``size`` raw bytes.  The sender is meant to run in its
+own thread (core/app.py starts it), and the receiver runs in the
+connection thread of the TCP server, so chat is never blocked.
+"""
 import os
 import socket
-import threading
 import time
 
-from transport.protocol import CHUNK_SIZE, clean_filename, encode_file_header
+from transport.protocol import close_quietly, encode_file, sanitize_filename
 
+CHUNK_SIZE = 64 * 1024
 CONNECT_TIMEOUT = 5.0
-TRANSFER_TIMEOUT = 30.0
+PROGRESS_INTERVAL = 0.1
+
+# Project root is the parent of the transport/ package, so downloads/ is
+# always the same folder no matter where the program is started from.
 DOWNLOADS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "downloads"
-)
-
-_save_lock = threading.Lock()
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "downloads")
 
 
-def send_file(ip, port, path, on_progress=None):
-    """Send `path` to `(ip, port)` over a dedicated TCP connection.
+def send_file(ip, port, path, on_progress):
+    """Send one file to ``ip:port``.  Blocking; raises OSError on failure.
 
-    Calls `on_progress(percent)` with integer percentages 0..100.
-    Raises FileNotFoundError, ConnectionError, or OSError on failure.
+    ``on_progress(percent)`` is called with 0..100, at most about ten
+    times per second (plus the final 100), so the console is not flooded.
     """
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"File not found: {path}")
+        raise FileNotFoundError(f"file not found: {path}")
 
     size = os.path.getsize(path)
-    filename = clean_filename(path)
+    filename = sanitize_filename(os.path.basename(path))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(CONNECT_TIMEOUT)
     try:
-        sock.settimeout(CONNECT_TIMEOUT)
-        try:
-            sock.connect((ip, port))
-        except OSError as exc:
-            raise ConnectionError(f"Cannot connect to {ip}:{port}") from exc
+        sock.connect((ip, port))
+        sock.settimeout(None)
+        sock.sendall(encode_file(filename, size))
 
-        sock.settimeout(TRANSFER_TIMEOUT)
-        sock.sendall(encode_file_header(filename, size))
-
-        if size == 0:
-            if on_progress is not None:
-                on_progress(100)
-        else:
-            sent = 0
-            last_reported = 0
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    sock.sendall(chunk)
-                    sent += len(chunk)
-                    percent = (sent * 100) // size
-                    if on_progress is not None and (
-                        percent - last_reported >= 10 or percent == 100
-                    ):
-                        last_reported = percent
-                        on_progress(percent)
-
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-    finally:
-        try:
-            sock.close()
-        except OSError:
-            pass
-
-
-def receive_file(sock, sender_ip, filename, size, on_file, on_error):
-    """Receive `size` raw bytes from `sock` into `downloads/` safely."""
-    safe_name = clean_filename(filename)
-    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-    temp_name = f".{safe_name}.{threading.get_ident()}.{time.monotonic_ns()}.part"
-    temp_path = os.path.join(DOWNLOADS_DIR, temp_name)
-
-    try:
-        sock.settimeout(TRANSFER_TIMEOUT)
-        remaining = size
-        with open(temp_path, "wb") as out:
+        _emit(on_progress, 0)
+        sent = 0
+        last_percent = 0
+        last_time = time.monotonic()
+        with open(path, "rb") as handle:
+            remaining = size
             while remaining > 0:
-                chunk = sock.recv(min(CHUNK_SIZE, remaining))
+                chunk = handle.read(min(CHUNK_SIZE, remaining))
                 if not chunk:
-                    raise ConnectionError("Transfer interrupted before completion")
-                out.write(chunk)
+                    raise OSError(
+                        f"file shrank during transfer: {filename}")
+                sock.sendall(chunk)
                 remaining -= len(chunk)
+                sent += len(chunk)
+                percent = int(sent * 100 / size)
+                now = time.monotonic()
+                if percent > last_percent and (
+                        percent >= 100
+                        or now - last_time >= PROGRESS_INTERVAL):
+                    _emit(on_progress, percent)
+                    last_percent = percent
+                    last_time = now
+        if last_percent < 100:
+            _emit(on_progress, 100)
+    finally:
+        close_quietly(sock)
 
-        with _save_lock:
-            final_path = _unique_path(DOWNLOADS_DIR, safe_name)
-            os.replace(temp_path, final_path)
 
-        if on_file is not None:
-            on_file(sender_ip, final_path, size)
-    except (OSError, ConnectionError) as exc:
-        if os.path.exists(temp_path):
+def receive_file(sock, filename, size, from_ip, on_file, on_error):
+    """Receive one file from *sock* into :data:`DOWNLOADS_DIR`.
+
+    Returns the saved path, or None when the transfer failed.  A failed
+    transfer removes the partial file and reports the reason through
+    ``on_error(message)``.
+    """
+    filename = sanitize_filename(filename)
+    if size < 0:
+        _report_error(on_error, f"invalid size for {filename} from {from_ip}")
+        return None
+
+    path = None
+    try:
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        path, handle = _open_unique(DOWNLOADS_DIR, filename)
+        received = 0
+        try:
+            while received < size:
+                chunk = sock.recv(min(CHUNK_SIZE, size - received))
+                if not chunk:
+                    raise ConnectionError(
+                        "connection closed during the transfer")
+                handle.write(chunk)
+                received += len(chunk)
+        finally:
+            handle.close()
+    except OSError as exc:
+        if path is not None:
             try:
-                os.remove(temp_path)
+                os.remove(path)
             except OSError:
                 pass
-        if on_error is not None:
-            on_error(f"Failed to receive '{safe_name}' from {sender_ip}: {exc}")
+        _report_error(
+            on_error,
+            f"failed to receive {filename} from {from_ip}: {exc}")
+        return None
+
+    if on_file is not None:
+        try:
+            on_file(from_ip, path, size)
+        except Exception:
+            pass
+    return path
 
 
-def _unique_path(directory, filename):
-    """Return a non-colliding path in `directory`, adding (1), (2), ... if needed."""
-    candidate = os.path.join(directory, filename)
-    if not os.path.exists(candidate):
-        return candidate
-
+def _open_unique(directory, filename):
+    """Create *filename* in *directory*, adding ``(n)`` when it exists."""
     stem, ext = os.path.splitext(filename)
-    counter = 1
+    if not stem:
+        stem, ext = filename, ""
+    candidate = filename
+    counter = 0
     while True:
-        candidate = os.path.join(directory, f"{stem}({counter}){ext}")
-        if not os.path.exists(candidate):
-            return candidate
-        counter += 1
+        path = os.path.join(directory, candidate)
+        try:
+            return path, open(path, "xb")
+        except FileExistsError:
+            counter += 1
+            candidate = f"{stem} ({counter}){ext}"
+
+
+def _emit(on_progress, percent):
+    if on_progress is None:
+        return
+    try:
+        on_progress(percent)
+    except Exception:
+        pass
+
+
+def _report_error(on_error, message):
+    if on_error is None:
+        return
+    try:
+        on_error(message)
+    except Exception:
+        pass
